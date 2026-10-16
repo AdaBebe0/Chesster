@@ -44,4 +44,83 @@ function createRateLimiter({
 	return rateLimiter;
 }
 
-module.exports = { createRateLimiter };
+/**
+ * Tracks hit counts for a single key space within a fixed window, without
+ * attaching HTTP semantics. Shared by `createAuthChallengeRateLimiter` so the
+ * IP and wallet-address windows can be checked independently before either
+ * one writes a response.
+ */
+function createWindowCounter({ windowMs, max }) {
+	const hits = new Map(); // key -> { count, resetAt }
+
+	return {
+		hit(key) {
+			const now = Date.now();
+			let entry = hits.get(key);
+
+			if (!entry || now >= entry.resetAt) {
+				entry = { count: 0, resetAt: now + windowMs };
+				hits.set(key, entry);
+			}
+
+			entry.count += 1;
+
+			return {
+				exceeded: entry.count > max,
+				retryAfterSec: Math.ceil((entry.resetAt - now) / 1000),
+			};
+		},
+		reset() {
+			hits.clear();
+		},
+	};
+}
+
+/**
+ * Sliding-window-style limiter for the wallet auth challenge endpoint
+ * (`POST /api/auth/challenge`), enforcing two independent caps:
+ *   - `ipMax` requests per `windowMs` from a single IP address.
+ *   - `addressMax` pending challenge requests per `windowMs` for the same
+ *     wallet address, regardless of source IP (skipped when no address is
+ *     present on the request; the IP cap still applies).
+ *
+ * Responds with the structured 429 shape required by the auth challenge
+ * contract: `{ error: 'Too Many Requests', retryAfter: <seconds> }`.
+ */
+function createAuthChallengeRateLimiter({
+	windowMs = 60_000,
+	ipMax = 10,
+	addressMax = 3,
+	addressGenerator = (req) => req.body?.address || req.query?.address,
+} = {}) {
+	const ipCounter = createWindowCounter({ windowMs, max: ipMax });
+	const addressCounter = createWindowCounter({ windowMs, max: addressMax });
+
+	function reject(res, retryAfterSec) {
+		res.set("Retry-After", String(retryAfterSec));
+		return res.status(429).json({ error: "Too Many Requests", retryAfter: retryAfterSec });
+	}
+
+	function authChallengeRateLimiter(req, res, next) {
+		const ipKey = req.ip || req.connection?.remoteAddress || "unknown";
+		const ipResult = ipCounter.hit(ipKey);
+		if (ipResult.exceeded) return reject(res, ipResult.retryAfterSec);
+
+		const address = addressGenerator(req);
+		if (address) {
+			const addressResult = addressCounter.hit(`addr:${address}`);
+			if (addressResult.exceeded) return reject(res, addressResult.retryAfterSec);
+		}
+
+		return next();
+	}
+
+	authChallengeRateLimiter.reset = () => {
+		ipCounter.reset();
+		addressCounter.reset();
+	};
+
+	return authChallengeRateLimiter;
+}
+
+module.exports = { createRateLimiter, createAuthChallengeRateLimiter };

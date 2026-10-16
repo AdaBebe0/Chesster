@@ -31,6 +31,8 @@ pub const DEFAULT_MIN_WAGER: i128 = 1;
 pub const DEFAULT_MAX_WAGER: i128 = i128::MAX;
 /// Maximum allowable tournament fee in basis points (500 bps = 5%) (Issue #221).
 pub const MAX_TOURNAMENT_FEE_BPS: u32 = 500;
+/// Upper bound on a per-asset protocol fee tier configured via `AssetConfig` (Issue #431).
+pub const MAX_ASSET_FEE_BPS: u32 = 1_000;
 /// Basis points denominator (10,000 bps = 100%) (Issue #221).
 pub const BPS_DENOMINATOR: i128 = 10_000;
 
@@ -477,6 +479,35 @@ pub struct TokenWagerLimitsUpdatedEvent {
     pub max_wager: i128,
 }
 
+/// Per-asset wager bounds, protocol fee tier, and enablement flag for a
+/// whitelisted wager token (Issue #431). Lets the coordinator register
+/// pegged stablecoins (e.g. Stellar USDC) or community tokens with their own
+/// limits and fee tier without redeploying the contract.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetConfig {
+    /// Minimum allowable wager amount for this asset.
+    pub min_wager: i128,
+    /// Maximum allowable wager amount for this asset.
+    pub max_wager: i128,
+    /// Protocol fee tier in basis points for matches wagered in this asset.
+    pub fee_bps: u32,
+    /// Whether matches may currently be created using this asset.
+    pub enabled: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Published after the coordinator adds, updates, or deprecates an asset's configuration.
+pub struct AssetConfigUpdatedEvent {
+    /// Token whose configuration was updated.
+    pub token: Address,
+    pub min_wager: i128,
+    pub max_wager: i128,
+    pub fee_bps: u32,
+    pub enabled: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Published when a match passes its configured expiration time.
@@ -742,6 +773,8 @@ pub enum DataKey {
     AccountNonce(Address),
     /// Emergency drain schedule (recipient, unlock_time) (Issue #285).
     DrainSchedule,
+    /// Per-asset wager limits, fee tier, and enablement flag (Issue #431).
+    AssetConfig(Address),
 }
 
 /// Aggregated operational metrics for off-chain indexing and monitoring (Issue #288).
@@ -2260,6 +2293,26 @@ impl ChessterEscrow {
         if amount <= 0 {
             panic_with_error!(env, EscrowError::InvalidWager);
         }
+
+        // When a per-asset AssetConfig is registered for this token (Issue #431),
+        // it is the authoritative source for enablement and wager bounds,
+        // superseding the legacy global/per-token wager limits below.
+        if let Some(config) = Self::get_asset_config(env.clone(), token.clone()) {
+            // EscrowError is already at the XDR contracterror case limit, so a
+            // disabled asset reuses TokenNotWhitelisted: both mean "this token
+            // cannot currently be wagered with".
+            if !config.enabled {
+                panic_with_error!(env, EscrowError::TokenNotWhitelisted);
+            }
+            if amount < config.min_wager {
+                panic_with_error!(env, EscrowError::WagerBelowMinimum);
+            }
+            if amount > config.max_wager {
+                panic_with_error!(env, EscrowError::WagerAboveMaximum);
+            }
+            return;
+        }
+
         let limits = Self::get_token_wager_limits(env.clone(), token.clone());
         if amount < limits.min_wager {
             panic_with_error!(env, EscrowError::WagerBelowMinimum);
@@ -2267,6 +2320,49 @@ impl ChessterEscrow {
         if amount > limits.max_wager {
             panic_with_error!(env, EscrowError::WagerAboveMaximum);
         }
+    }
+
+    /// Registers or updates the whitelist/fee/limit configuration for a wager
+    /// asset (Coordinator only) (Issue #431). Validates the fee tier and wager
+    /// bounds before persisting, and publishes an `asset_config_updated` event.
+    pub fn set_asset_config(env: Env, token: Address, config: AssetConfig) {
+        let coordinator = Self::get_coordinator(env.clone());
+        coordinator.require_auth();
+
+        // Reuses InvalidWager, mirroring the existing set_fee_bps convention,
+        // since EscrowError has no spare case slots (see the comment above).
+        if config.fee_bps > MAX_ASSET_FEE_BPS {
+            panic_with_error!(&env, EscrowError::InvalidWager);
+        }
+        if config.min_wager <= 0 || config.max_wager < config.min_wager {
+            panic_with_error!(&env, EscrowError::InvalidWagerLimit);
+        }
+
+        let key = DataKey::AssetConfig(token.clone());
+        env.storage().persistent().set(&key, &config);
+        Self::bump_entry_ttl(&env, &key);
+        Self::bump_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "asset_config_updated"), token.clone()),
+            AssetConfigUpdatedEvent {
+                token,
+                min_wager: config.min_wager,
+                max_wager: config.max_wager,
+                fee_bps: config.fee_bps,
+                enabled: config.enabled,
+            },
+        );
+    }
+
+    /// Retrieves the registered `AssetConfig` for a wager asset, if any (Issue #431).
+    pub fn get_asset_config(env: Env, token: Address) -> Option<AssetConfig> {
+        let key = DataKey::AssetConfig(token);
+        let config = env.storage().persistent().get(&key);
+        if config.is_some() {
+            Self::bump_entry_ttl(&env, &key);
+        }
+        config
     }
 
     /// Creates a match and deposits Player 1's wager with default expiration duration (Issue #34).

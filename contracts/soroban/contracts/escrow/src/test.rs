@@ -6,7 +6,7 @@ use super::*;
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::token::StellarAssetClient as TokenAdminClient;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger},
+    testutils::{storage::Persistent as _, Address as _, Events, Ledger},
     vec, Address, Env, String,
 };
 
@@ -1596,6 +1596,190 @@ fn test_token_wager_limits_config() {
 }
 
 #[test]
+fn test_asset_config_happy_path() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let coordinator = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token, token_admin_client) = create_token_contract(&env, &token_admin);
+    let contract_id = env.register(ChessterEscrow, ());
+    let client = ChessterEscrowClient::new(&env, &contract_id);
+    client.init(&coordinator, &500);
+
+    assert!(client.get_asset_config(&token.address).is_none());
+
+    let config = AssetConfig {
+        min_wager: 10,
+        max_wager: 1_000,
+        fee_bps: 250,
+        enabled: true,
+    };
+    client.set_asset_config(&token.address, &config);
+
+    let stored = client.get_asset_config(&token.address).unwrap();
+    assert_eq!(stored.min_wager, 10);
+    assert_eq!(stored.max_wager, 1_000);
+    assert_eq!(stored.fee_bps, 250);
+    assert!(stored.enabled);
+
+    // create_match succeeds inside the configured bounds.
+    let player1 = Address::generate(&env);
+    token_admin_client.mint(&player1, &500);
+    approve(&env, &token, &player1, &contract_id, 500);
+    let game_code = String::from_str(&env, "ASSET_OK");
+    client.create_match(&game_code, &player1, &token.address, &500);
+    assert_eq!(client.get_match(&game_code).wager_amount, 500);
+}
+
+#[test]
+fn test_set_asset_config_rejects_unauthorized_caller() {
+    let env = Env::default();
+    let coordinator = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token, _) = create_token_contract(&env, &token_admin);
+    let contract_id = env.register(ChessterEscrow, ());
+    let client = ChessterEscrowClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    client.init(&coordinator, &500);
+
+    // Disallow mock auths: the coordinator's require_auth() inside
+    // set_asset_config must now reject the call.
+    env.set_auths(&[]);
+    let config = AssetConfig {
+        min_wager: 10,
+        max_wager: 1_000,
+        fee_bps: 100,
+        enabled: true,
+    };
+    let res = client.try_set_asset_config(&token.address, &config);
+    assert!(
+        res.is_err(),
+        "Non-coordinator or unauthorized call must fail"
+    );
+}
+
+#[test]
+fn test_asset_config_rejects_invalid_fee_bps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let coordinator = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token, _) = create_token_contract(&env, &token_admin);
+    let contract_id = env.register(ChessterEscrow, ());
+    let client = ChessterEscrowClient::new(&env, &contract_id);
+    client.init(&coordinator, &500);
+
+    let config = AssetConfig {
+        min_wager: 10,
+        max_wager: 1_000,
+        fee_bps: MAX_ASSET_FEE_BPS + 1,
+        enabled: true,
+    };
+    assert!(client
+        .try_set_asset_config(&token.address, &config)
+        .is_err());
+}
+
+#[test]
+fn test_asset_config_rejects_invalid_wager_bounds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let coordinator = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token, _) = create_token_contract(&env, &token_admin);
+    let contract_id = env.register(ChessterEscrow, ());
+    let client = ChessterEscrowClient::new(&env, &contract_id);
+    client.init(&coordinator, &500);
+
+    let non_positive_min = AssetConfig {
+        min_wager: 0,
+        max_wager: 1_000,
+        fee_bps: 100,
+        enabled: true,
+    };
+    assert!(client
+        .try_set_asset_config(&token.address, &non_positive_min)
+        .is_err());
+
+    let min_above_max = AssetConfig {
+        min_wager: 2_000,
+        max_wager: 1_000,
+        fee_bps: 100,
+        enabled: true,
+    };
+    assert!(client
+        .try_set_asset_config(&token.address, &min_above_max)
+        .is_err());
+}
+
+#[test]
+fn test_create_match_rejects_disabled_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let coordinator = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token, _) = create_token_contract(&env, &token_admin);
+    let contract_id = env.register(ChessterEscrow, ());
+    let client = ChessterEscrowClient::new(&env, &contract_id);
+    client.init(&coordinator, &500);
+
+    client.set_asset_config(
+        &token.address,
+        &AssetConfig {
+            min_wager: 10,
+            max_wager: 1_000,
+            fee_bps: 100,
+            enabled: false,
+        },
+    );
+
+    let player1 = Address::generate(&env);
+    approve(&env, &token, &player1, &contract_id, 500);
+    let game_code = String::from_str(&env, "ASSET_DISABLED");
+    assert!(client
+        .try_create_match(&game_code, &player1, &token.address, &500)
+        .is_err());
+}
+
+#[test]
+fn test_create_match_rejects_out_of_bounds_wager_for_asset_config() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let coordinator = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token, _) = create_token_contract(&env, &token_admin);
+    let contract_id = env.register(ChessterEscrow, ());
+    let client = ChessterEscrowClient::new(&env, &contract_id);
+    client.init(&coordinator, &500);
+
+    client.set_asset_config(
+        &token.address,
+        &AssetConfig {
+            min_wager: 50,
+            max_wager: 200,
+            fee_bps: 100,
+            enabled: true,
+        },
+    );
+
+    let player1 = Address::generate(&env);
+    approve(&env, &token, &player1, &contract_id, 1_000);
+
+    // Below the configured minimum.
+    let below_min = String::from_str(&env, "ASSET_BELOW_MIN");
+    assert!(client
+        .try_create_match(&below_min, &player1, &token.address, &10)
+        .is_err());
+
+    // Above the configured maximum.
+    let above_max = String::from_str(&env, "ASSET_ABOVE_MAX");
+    assert!(client
+        .try_create_match(&above_max, &player1, &token.address, &500)
+        .is_err());
+}
+
+#[test]
 fn test_match_timeout_config() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2287,6 +2471,112 @@ fn test_contract_storage_ttl_auto_extension() {
 
     let match_data = client.get_match(&game_code);
     assert_eq!(match_data.status, MatchStatus::Pending);
+}
+
+fn match_ttl(env: &Env, contract_id: &Address, game_code: &String) -> u32 {
+    env.as_contract(contract_id, || {
+        env.storage().persistent().get_ttl(game_code)
+    })
+}
+
+/// Issue #432: proves the ledger TTL of a match's persistent storage entry
+/// actually increases — not just that the call succeeds — when the
+/// permissionless `extend_match_ttl` maintenance entrypoint is called on a
+/// match nearing its eviction threshold.
+#[test]
+fn test_extend_match_ttl_bumps_persistent_entry_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let coordinator = Address::generate(&env);
+    let player1 = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let (token, token_admin_client) = create_token_contract(&env, &token_admin);
+    token_admin_client.mint(&player1, &1000);
+
+    let contract_id = env.register(ChessterEscrow, ());
+    let client = ChessterEscrowClient::new(&env, &contract_id);
+
+    client.init(&coordinator, &500);
+    client.add_whitelisted_token(&token.address);
+
+    let game_code = String::from_str(&env, "GAME_TTL_2");
+    approve(&env, &token, &player1, &contract_id, 100);
+    client.create_match(&game_code, &player1, &token.address, &100);
+
+    let ttl_after_create = match_ttl(&env, &contract_id, &game_code);
+
+    // Let the match's TTL decay close to (but not below) its eviction
+    // threshold, simulating a long-running correspondence-style match.
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + ttl_after_create - 10);
+    let ttl_before_bump = match_ttl(&env, &contract_id, &game_code);
+    assert!(ttl_before_bump < ttl_after_create);
+
+    // A participant (or anyone) can proactively extend it at any point before expiration.
+    client.extend_match_ttl(&game_code);
+    let ttl_after_extend = match_ttl(&env, &contract_id, &game_code);
+    assert!(ttl_after_extend > ttl_before_bump);
+}
+
+/// Issue #432: the same TTL-eviction guard also covers mutating match
+/// interactions directly — here, `join_match` — matching the issue's
+/// requirement that `join_match`, `claim_refund`, and `forfeit_match` all
+/// bump the match's persistent TTL as a side effect, not just reads.
+#[test]
+fn test_join_match_bumps_persistent_entry_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let coordinator = Address::generate(&env);
+    let player1 = Address::generate(&env);
+    let player2 = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let (token, token_admin_client) = create_token_contract(&env, &token_admin);
+    token_admin_client.mint(&player1, &1000);
+    token_admin_client.mint(&player2, &1000);
+
+    let contract_id = env.register(ChessterEscrow, ());
+    let client = ChessterEscrowClient::new(&env, &contract_id);
+
+    client.init(&coordinator, &500);
+    client.add_whitelisted_token(&token.address);
+
+    let game_code = String::from_str(&env, "GAME_TTL_3");
+    approve(&env, &token, &player1, &contract_id, 100);
+    client.create_match(&game_code, &player1, &token.address, &100);
+
+    let ttl_after_create = match_ttl(&env, &contract_id, &game_code);
+
+    // The token contract's own instance isn't touched by this test's match
+    // mechanics, so give it enough TTL headroom to survive the large ledger
+    // advance below (otherwise it would archive and the later token call
+    // inside join_match would fail for an unrelated, uninteresting reason).
+    env.as_contract(&token.address, || {
+        env.storage()
+            .instance()
+            .extend_ttl(ttl_after_create, ttl_after_create);
+    });
+
+    // Player 2's allowance must outlive the advance below, so give it an
+    // expiration far beyond the default +1_000 ledgers the `approve` helper uses.
+    token.approve(
+        &player2,
+        &contract_id,
+        &100,
+        &(env.ledger().sequence() + ttl_after_create),
+    );
+
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + ttl_after_create - 10);
+    let ttl_before_join = match_ttl(&env, &contract_id, &game_code);
+    assert!(ttl_before_join < ttl_after_create);
+
+    client.join_match(&game_code, &player2);
+    let ttl_after_join = match_ttl(&env, &contract_id, &game_code);
+    assert!(ttl_after_join > ttl_before_join);
 }
 
 #[test]

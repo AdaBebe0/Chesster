@@ -1338,6 +1338,42 @@ class GameModel {
 		if (error) throw error;
 		return data;
 	}
+
+	/**
+	 * Bulk-inserts validated, already-played PGN games (Issue #436) as
+	 * finished/archived records. Each entry is a validated game from
+	 * `pgnService` (headers, final board, moves, result). Generates a unique
+	 * game_code per row the same way `createGame` does.
+	 */
+	async batchImportGames(games) {
+		if (!games || games.length === 0) return [];
+
+		const rows = games.map((game) => {
+			const resultTag = game.result;
+			const winner = resultTag === "1-0" ? "white" : resultTag === "0-1" ? "black" : null;
+			const isDraw = resultTag === "1/2-1/2";
+
+			return {
+				game_code: this.generateGameCode(),
+				game_type: "chess",
+				variant: "standard",
+				board_state: game.finalBoard,
+				current_turn: game.nextTurn,
+				status: "finished",
+				winner,
+				is_draw: isDraw,
+				move_count: game.moves.length,
+				move_history: game.moves,
+				end_reason: "imported",
+				is_archived: true,
+				archival_status: "archived",
+			};
+		});
+
+		const { data, error } = await supabase.from("games").insert(rows).select("id, game_code");
+		if (error) throw error;
+		return data;
+	}
 }
 
 const gameModel = new GameModel();

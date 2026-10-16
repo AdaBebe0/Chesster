@@ -1,4 +1,4 @@
-const { createRateLimiter } = require("../middleware/rateLimiter");
+const { createRateLimiter, createAuthChallengeRateLimiter } = require("../middleware/rateLimiter");
 const { sanitizeInput, containsDangerousPayload, stripHtml } = require("../middleware/sanitizeInput");
 
 function mockReq(overrides = {}) {
@@ -147,6 +147,107 @@ describe("rateLimiter", () => {
 		it("exposes a reset() helper that clears tracked counts", () => {
 			const limiter = createRateLimiter({ windowMs: 60_000, max: 1 });
 			const req = mockReq();
+
+			limiter(req, mockRes(), jest.fn());
+			limiter.reset();
+
+			const res = mockRes();
+			const next = jest.fn();
+			limiter(req, res, next);
+
+			expect(next).toHaveBeenCalled();
+			expect(res.status).not.toHaveBeenCalled();
+		});
+	});
+	describe("createAuthChallengeRateLimiter", () => {
+		it("allows requests under both the IP and address limits", () => {
+			const limiter = createAuthChallengeRateLimiter({ windowMs: 60_000, ipMax: 10, addressMax: 3 });
+			const req = mockReq({ body: { address: "GABC" } });
+			const res = mockRes();
+			const next = jest.fn();
+
+			limiter(req, res, next);
+
+			expect(next).toHaveBeenCalled();
+			expect(res.status).not.toHaveBeenCalled();
+		});
+
+		it("rejects the 11th request from the same IP with 429 and Retry-After", () => {
+			const limiter = createAuthChallengeRateLimiter({ windowMs: 60_000, ipMax: 10, addressMax: 100 });
+			const req = mockReq({ ip: "9.9.9.9", body: { address: null } });
+
+			for (let i = 0; i < 10; i++) {
+				const req2 = mockReq({ ip: "9.9.9.9", body: { address: `GADDR${i}` } });
+				limiter(req2, mockRes(), jest.fn());
+			}
+
+			const res = mockRes();
+			const next = jest.fn();
+			limiter(mockReq({ ip: "9.9.9.9", body: { address: "GADDR_OVER" } }), res, next);
+
+			expect(res.status).toHaveBeenCalledWith(429);
+			expect(res.json).toHaveBeenCalledWith(
+				expect.objectContaining({ error: "Too Many Requests", retryAfter: expect.any(Number) }),
+			);
+			expect(res.set).toHaveBeenCalledWith("Retry-After", expect.any(String));
+			expect(next).not.toHaveBeenCalled();
+		});
+
+		it("rejects the 4th pending challenge for the same wallet address with 429", () => {
+			const limiter = createAuthChallengeRateLimiter({ windowMs: 60_000, ipMax: 100, addressMax: 3 });
+
+			for (let i = 0; i < 3; i++) {
+				const req = mockReq({ ip: `1.1.1.${i}`, body: { address: "GSAME" } });
+				limiter(req, mockRes(), jest.fn());
+			}
+
+			const res = mockRes();
+			const next = jest.fn();
+			limiter(mockReq({ ip: "1.1.1.9", body: { address: "GSAME" } }), res, next);
+
+			expect(res.status).toHaveBeenCalledWith(429);
+			expect(res.json).toHaveBeenCalledWith(
+				expect.objectContaining({ error: "Too Many Requests", retryAfter: expect.any(Number) }),
+			);
+			expect(next).not.toHaveBeenCalled();
+		});
+
+		it("does not enforce the address limit when no address is present", () => {
+			const limiter = createAuthChallengeRateLimiter({ windowMs: 60_000, ipMax: 100, addressMax: 1 });
+
+			for (let i = 0; i < 5; i++) {
+				const req = mockReq({ ip: `2.2.2.${i}`, body: {} });
+				limiter(req, mockRes(), jest.fn());
+			}
+
+			const res = mockRes();
+			const next = jest.fn();
+			limiter(mockReq({ ip: "2.2.2.9", body: {} }), res, next);
+
+			expect(next).toHaveBeenCalled();
+			expect(res.status).not.toHaveBeenCalled();
+		});
+
+		it("tracks separate address windows independently of IP", () => {
+			const limiter = createAuthChallengeRateLimiter({ windowMs: 60_000, ipMax: 100, addressMax: 3 });
+
+			for (let i = 0; i < 3; i++) {
+				limiter(mockReq({ ip: "3.3.3.1", body: { address: "GWALLET" } }), mockRes(), jest.fn());
+			}
+
+			const blocked = mockRes();
+			limiter(mockReq({ ip: "3.3.3.1", body: { address: "GWALLET" } }), blocked, jest.fn());
+			expect(blocked.status).toHaveBeenCalledWith(429);
+
+			const otherWallet = mockRes();
+			const next = jest.fn();
+			limiter(mockReq({ ip: "3.3.3.1", body: { address: "GOTHER" } }), otherWallet, next);
+			expect(next).toHaveBeenCalled();
+		});
+
+		it("exposes a reset() helper that clears both windows", () => {
+			const limiter = createAuthChallengeRateLimiter({ windowMs: 60_000, ipMax: 1, addressMax: 1 });
+			const req = mockReq({ ip: "4.4.4.4", body: { address: "GRESET" } });
 
 			limiter(req, mockRes(), jest.fn());
 			limiter.reset();

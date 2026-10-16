@@ -276,4 +276,59 @@ describe("Game Model", () => {
       expect(result).toBeDefined();
     });
   });
+
+  describe("batchImportGames", () => {
+    it("returns an empty array without touching the database when given no games", async () => {
+      const supabase = require("../config/supabase");
+      supabase.from.mockClear();
+
+      const result = await gameModel.batchImportGames([]);
+
+      expect(result).toEqual([]);
+      expect(supabase.from).not.toHaveBeenCalled();
+    });
+
+    it("maps validated PGN games into insertable rows and inserts them in one call", async () => {
+      const supabase = require("../config/supabase");
+      supabase.from.mockClear();
+
+      const finalBoard = Array(8).fill(Array(8).fill("."));
+      const games = [
+        {
+          headers: { White: "Alice", Black: "Bob" },
+          result: "1-0",
+          moves: [{ ply: 1, color: "white", san: "e4" }],
+          finalBoard,
+          nextTurn: "black",
+        },
+        {
+          headers: { White: "Carl", Black: "Dee" },
+          result: "1/2-1/2",
+          moves: [],
+          finalBoard,
+          nextTurn: "white",
+        },
+      ];
+
+      const result = await gameModel.batchImportGames(games);
+
+      expect(supabase.from).toHaveBeenCalledWith("games");
+      expect(result).toBeDefined();
+
+      const insertedRows = supabase._mockQuery.insert.mock.calls[0][0];
+      expect(insertedRows).toHaveLength(2);
+      expect(insertedRows[0]).toMatchObject({
+        status: "finished",
+        winner: "white",
+        is_draw: false,
+        is_archived: true,
+      });
+      expect(insertedRows[1]).toMatchObject({
+        winner: null,
+        is_draw: true,
+      });
+      // Every imported row gets its own generated game_code.
+      expect(insertedRows[0].game_code).not.toBe(insertedRows[1].game_code);
+    });
+  });
 });

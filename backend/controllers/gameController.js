@@ -9,6 +9,7 @@ const REPLAY_HEARTBEAT_MS = 15000;
 const auditService = require("../services/auditService");
 const chessEngine = require("../services/chessEngine");
 const leaderboardService = require("../services/leaderboardService");
+const pgnService = require("../services/pgnService");
 
 const AUDIT_FORMATS = new Set(["json", "csv"]);
 
@@ -197,6 +198,31 @@ class GameController {
 				"Content-Disposition": `attachment; filename=game-${game.game_code || game.id}.pgn`,
 			});
 			return res.send(pgn);
+		} catch (error) {
+			return res.status(500).json({ success: false, error: error.message });
+		}
+	}
+
+	/**
+	 * POST /api/games/import-pgn — bulk import of historical matches or
+	 * tournament archives (Issue #436). Streams the uploaded PGN text through
+	 * `pgnService` so multi-game, multi-megabyte archives are parsed and
+	 * validated incrementally rather than blocking the event loop, and
+	 * batch-inserts valid games 50 at a time. Malformed games are skipped and
+	 * reported individually instead of failing the whole import.
+	 */
+	async importPgnHandler(req, res) {
+		try {
+			const pgnText = typeof req.body === "string" ? req.body : req.body?.pgn;
+			if (!pgnText || !pgnText.trim()) {
+				return res.status(400).json({ success: false, error: "Request body must contain PGN text" });
+			}
+
+			const summary = await pgnService.importPgn(pgnText, {
+				persistBatch: (batch) => gameModel.batchImportGames(batch),
+			});
+
+			return res.json({ success: true, data: summary });
 		} catch (error) {
 			return res.status(500).json({ success: false, error: error.message });
 		}
