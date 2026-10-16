@@ -7926,67 +7926,79 @@ mod extended_tests {
         let mut runner = TestRunner::new(ProptestConfig::with_cases(1_000));
 
         runner
-            .run(&scenario, |(player_count, wager, fee_bps, first_bps, second_bps)| {
-                prop_assume!(first_bps + second_bps < 10_000);
-                let third_bps = 10_000 - first_bps - second_bps;
-                let env = Env::default();
-                env.mock_all_auths();
+            .run(
+                &scenario,
+                |(player_count, wager, fee_bps, first_bps, second_bps)| {
+                    prop_assume!(first_bps + second_bps < 10_000);
+                    let third_bps = 10_000 - first_bps - second_bps;
+                    let env = Env::default();
+                    env.mock_all_auths();
 
-                let coordinator = Address::generate(&env);
-                let treasury = Address::generate(&env);
-                let token_admin = Address::generate(&env);
-                let (token, token_admin_client) = create_token_contract(&env, &token_admin);
-                let contract_id = env.register(ChessterEscrow, ());
-                let client = ChessterEscrowClient::new(&env, &contract_id);
-                client.init(&coordinator, &fee_bps);
-                client.set_treasury_vault(&treasury);
-                client.set_tournament_fee_bps(&fee_bps);
-                client.add_supported_token(&token.address);
+                    let coordinator = Address::generate(&env);
+                    let treasury = Address::generate(&env);
+                    let token_admin = Address::generate(&env);
+                    let (token, token_admin_client) = create_token_contract(&env, &token_admin);
+                    let contract_id = env.register(ChessterEscrow, ());
+                    let client = ChessterEscrowClient::new(&env, &contract_id);
+                    client.init(&coordinator, &fee_bps);
+                    client.set_treasury_vault(&treasury);
+                    client.set_tournament_fee_bps(&fee_bps);
+                    client.add_supported_token(&token.address);
 
-                let mut players = alloc::vec::Vec::new();
-                for _ in 0..player_count {
-                    let player = Address::generate(&env);
-                    token_admin_client.mint(&player, &wager);
-                    approve(&env, &token, &player, &contract_id, wager);
-                    players.push(player);
-                }
+                    let mut players = alloc::vec::Vec::new();
+                    for _ in 0..player_count {
+                        let player = Address::generate(&env);
+                        token_admin_client.mint(&player, &wager);
+                        approve(&env, &token, &player, &contract_id, wager);
+                        players.push(player);
+                    }
 
-                let tournament_id = String::from_str(&env, "FUZZ_TOURNAMENT");
-                client.create_tournament(
-                    &tournament_id,
-                    &wager,
-                    &player_count,
-                    &player_count,
-                    &0,
-                    &token.address,
-                );
-                for player in &players {
-                    client.join_tournament(&tournament_id, player);
-                }
+                    let tournament_id = String::from_str(&env, "FUZZ_TOURNAMENT");
+                    client.create_tournament(
+                        &tournament_id,
+                        &wager,
+                        &player_count,
+                        &player_count,
+                        &0,
+                        &token.address,
+                    );
+                    for player in &players {
+                        client.join_tournament(&tournament_id, player);
+                    }
 
-                let winners = vec![&env, players[0].clone(), players[1].clone(), players[2].clone()];
-                let payout_bps = vec![&env, first_bps, second_bps, third_bps];
-                client.complete_tournament(&tournament_id, &winners, &payout_bps);
+                    let winners = vec![
+                        &env,
+                        players[0].clone(),
+                        players[1].clone(),
+                        players[2].clone(),
+                    ];
+                    let payout_bps = vec![&env, first_bps, second_bps, third_bps];
+                    client.complete_tournament(&tournament_id, &winners, &payout_bps);
 
-                let total_pool = wager * player_count as i128;
-                let (net_pool, protocol_fee) = client.calculate_tournament_rake(&total_pool, &fee_bps);
-                let first_payout = (net_pool * first_bps as i128) / 10_000;
-                let second_payout = (net_pool * second_bps as i128) / 10_000;
-                let third_payout = net_pool - first_payout - second_payout;
-                let first_gain = token.balance(&players[0]);
-                let second_gain = token.balance(&players[1]);
-                let third_gain = token.balance(&players[2]);
+                    let total_pool = wager * player_count as i128;
+                    let (net_pool, protocol_fee) =
+                        client.calculate_tournament_rake(&total_pool, &fee_bps);
+                    let first_payout = (net_pool * first_bps as i128) / 10_000;
+                    let second_payout = (net_pool * second_bps as i128) / 10_000;
+                    let third_payout = net_pool - first_payout - second_payout;
+                    let first_gain = token.balance(&players[0]);
+                    let second_gain = token.balance(&players[1]);
+                    let third_gain = token.balance(&players[2]);
 
-                prop_assert_eq!(first_gain, first_payout);
-                prop_assert_eq!(second_gain, second_payout);
-                prop_assert_eq!(third_gain, third_payout);
-                prop_assert!(first_gain > 0 && second_gain > 0 && third_gain > 0);
-                prop_assert_eq!(first_gain + second_gain + third_gain + protocol_fee, total_pool);
-                prop_assert_eq!(token.balance(&treasury), protocol_fee);
-                prop_assert_eq!(token.balance(&contract_id), 0);
-                prop_assert_eq!(client.get_escrowed_balance(&token.address), 0);
-                Ok(())
-            })
+                    prop_assert_eq!(first_gain, first_payout);
+                    prop_assert_eq!(second_gain, second_payout);
+                    prop_assert_eq!(third_gain, third_payout);
+                    prop_assert!(first_gain > 0 && second_gain > 0 && third_gain > 0);
+                    prop_assert_eq!(
+                        first_gain + second_gain + third_gain + protocol_fee,
+                        total_pool
+                    );
+                    prop_assert_eq!(token.balance(&treasury), protocol_fee);
+                    prop_assert_eq!(token.balance(&contract_id), 0);
+                    prop_assert_eq!(client.get_escrowed_balance(&token.address), 0);
+                    Ok(())
+                },
+            )
             .unwrap();
     }
 
